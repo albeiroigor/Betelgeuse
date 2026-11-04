@@ -1,0 +1,138 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+env:
+  BETELGEUSE_CLIENT_ID: ${{ vars.BETELGEUSE_CLIENT_ID }}
+  APP_REPOSITORY: ${{ github.repository }}
+
+jobs:
+  verify:
+    name: Verify
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Check tag matches pubspec version
+        shell: bash
+        run: |
+          version="$(sed -n 's/^version:[[:space:]]*//p' pubspec.yaml | head -n1 | cut -d+ -f1)"
+          if [ "v$version" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::pubspec.yaml=$version no coincide con el tag ${GITHUB_REF_NAME}."
+            exit 1
+          fi
+
+      - name: Check OAuth client id
+        shell: bash
+        run: |
+          if [ -z "$BETELGEUSE_CLIENT_ID" ]; then
+            echo "::error::Configura la variable de repositorio BETELGEUSE_CLIENT_ID."
+            exit 1
+          fi
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - run: flutter pub get
+      - run: dart format --output=none --set-exit-if-changed lib test
+      - run: flutter analyze
+      - run: flutter test
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64
+            os: ubuntu-24.04
+          - target: windows-x64
+            os: windows-2025
+          - target: macos-arm64
+            os: macos-26
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev libsecret-1-dev
+
+      - run: flutter pub get
+
+      - name: Build Linux
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          flutter build linux --release \
+            --dart-define=BETELGEUSE_CLIENT_ID="$BETELGEUSE_CLIENT_ID" \
+            --dart-define=APP_REPOSITORY="$APP_REPOSITORY"
+          mkdir -p dist
+          cp LICENSE README.md install.sh build/linux/x64/release/bundle/
+          tar -czf "dist/betelgeuse-${GITHUB_REF_NAME}-linux-x64.tar.gz" \
+            -C build/linux/x64/release/bundle .
+
+      - name: Build Windows
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          flutter build windows --release \
+            --dart-define=BETELGEUSE_CLIENT_ID="$BETELGEUSE_CLIENT_ID" \
+            --dart-define=APP_REPOSITORY="$APP_REPOSITORY"
+          mkdir -p dist
+          cp LICENSE build/windows/x64/runner/Release/
+          powershell -NoProfile -Command "Compress-Archive -Path 'build/windows/x64/runner/Release/*' -DestinationPath 'dist/betelgeuse-${GITHUB_REF_NAME}-windows-x64.zip' -Force"
+
+      - name: Build macOS
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          flutter build macos --release \
+            --dart-define=BETELGEUSE_CLIENT_ID="$BETELGEUSE_CLIENT_ID" \
+            --dart-define=APP_REPOSITORY="$APP_REPOSITORY"
+          mkdir -p dist
+          ditto -c -k --sequesterRsrc --keepParent \
+            "build/macos/Build/Products/Release/Betelgeuse.app" \
+            "dist/betelgeuse-${GITHUB_REF_NAME}-macos-arm64.zip"
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          name: Betelgeuse ${{ github.ref_name }}
+          files: dist/*
+          generate_release_notes: true
+          draft: false
